@@ -1,5 +1,5 @@
 use super::{
-    eth160, sign_simple_otx, sign_simple_otx_by_input_group, DummyDataLoader, CKB_CELL_UPGRADE_BIN,
+    eth160, blake160, sign_simple_otx, sign_simple_otx_by_input_group, sign_tx_by_input_group, DummyDataLoader, CKB_CELL_UPGRADE_BIN,
     MAX_CYCLES, SECP256K1_DATA_BIN, SIGHASH_ALL_BIN, SIMPLE_OTX_BIN,
 };
 use ckb_crypto::secp::Generator;
@@ -49,6 +49,39 @@ fn dummy_cell_output(shannons: u64) -> CellOutput {
         .capacity(Capacity::shannons(shannons).pack())
         .build()
 }
+
+fn secp_code_hash() -> Byte32 {
+    CellOutput::calc_data_hash(&SIGHASH_ALL_BIN)
+}
+
+fn gen_common_cell(
+    dummy: &mut DummyDataLoader,
+    capacity: Capacity,
+    lock_args: Bytes,
+    data: Bytes,
+)-> (CellOutput, OutPoint) {
+
+    let out_point = generate_random_out_point();
+
+    let lock = Script::new_builder()
+        .args(lock_args.pack())
+        .code_hash(secp_code_hash())
+        .hash_type(ScriptHashType::Data.into())
+        .build();
+
+    let cell = CellOutput::new_builder()
+        .capacity(capacity.pack())
+        .lock(lock)
+        .build();
+
+    dummy
+        .cells
+        .insert(out_point.clone(), (cell.clone(), data));
+
+    (cell, out_point)
+
+}
+
 
 fn gen_simple_otx_cell(
     dummy: &mut DummyDataLoader,
@@ -216,7 +249,72 @@ fn test_simple_otx_unlock() {
 }
 
 #[test]
-fn test_simple_otx_unbalanced() {}
+fn test_simple_otx_inputs_size_greater() {
+    let mut data_loader = DummyDataLoader::new();
+
+    let privkey = Generator::random_privkey();
+    let pubkey = privkey.pubkey().expect("pubkey");
+    let pubkey_hash = eth160(pubkey);
+
+    let (cell1, previous_out_point1) = gen_simple_otx_cell(
+        &mut data_loader,
+        Capacity::shannons(123456780000),
+        pubkey_hash.clone(),
+        Bytes::from("hello world"),
+    );
+
+    let (cell2, previous_out_point2) = gen_simple_otx_cell(
+        &mut data_loader,
+        Capacity::shannons(223456780000),
+        pubkey_hash,
+        Bytes::from("hello world 2"),
+    );
+
+    let input_cell_meta1 = CellMetaBuilder::from_cell_output(cell1, Bytes::from("hello world"))
+        .out_point(previous_out_point1.clone())
+        .build();
+    let input_cell_meta2 = CellMetaBuilder::from_cell_output(cell2, Bytes::from("hello world 2"))
+        .out_point(previous_out_point2.clone())
+        .build();
+    let resolved_inputs = vec![input_cell_meta1, input_cell_meta2];
+
+    let mut resolved_cell_deps = vec![];
+
+    let mut random_extra_witness = [0u8; 32];
+    let mut rng = thread_rng();
+    rng.fill(&mut random_extra_witness);
+    let witness_args = WitnessArgsBuilder::default()
+        .extra(Bytes::from(random_extra_witness.to_vec()).pack())
+        .build();
+
+    let output_data = Bytes::from("hello world 1").pack();
+    println!("output_data is {}", output_data);
+    let builder = TransactionBuilder::default()
+        .input(CellInput::new(previous_out_point1, 0x2003e8022a0002f3))
+        .input(CellInput::new(previous_out_point2, 0x2003e8022a0002f3))
+        .output(dummy_cell_output(123456780000))
+        .output_data(output_data)
+        .witness(witness_args.as_bytes().pack());
+
+    let (tx, mut resolved_cell_deps2) = complete_tx(&mut data_loader, builder);
+    let tx = sign_simple_otx(tx, &privkey);
+    for dep in resolved_cell_deps2.drain(..) {
+        resolved_cell_deps.push(dep);
+    }
+    let rtx = ResolvedTransaction {
+        transaction: tx,
+        resolved_inputs,
+        resolved_cell_deps,
+        resolved_dep_groups: vec![],
+    };
+
+    let verify_result = TransactionScriptsVerifier::new(&rtx, &data_loader).verify(MAX_CYCLES);
+    // verify_result.expect("pass verification");
+    assert_error_eq!(
+        verify_result.unwrap_err(),
+        ScriptError::ValidationFailure(-5),
+    );
+}
 
 #[test]
 fn test_simple_otx_with_two_keys() {
@@ -294,46 +392,75 @@ fn test_simple_otx_with_two_keys() {
 }
 
 #[test]
-fn test_simple_otx_for() {
+fn test_simple_otx_included_in_common_tx() {
+    let mut data_loader = DummyDataLoader::new();
+
+    //key1
+    let privkey1 = Generator::random_privkey();
+    let pubkey1 = privkey1.pubkey().expect("pubkey");
+    let pubkey_hash1 = eth160(pubkey1);
+
+    //key2
     let privkey2 = Generator::random_privkey();
+    let pubkey2 = privkey2.pubkey().expect("pubkey");
+    let pubkey_hash2 = blake160(&pubkey2.serialize());
 
-    let tx_hash: Vec<u8> = vec![
-        0xbc, 0xd3, 0x21, 0xac, 0x06, 0xf9, 0xc7, 0x10, 0x77, 0x49, 0x89, 0x16, 0x21, 0x5b, 0x40,
-        0x4e, 0xfb, 0x4d, 0x09, 0xcc, 0x11, 0xa6, 0xcf, 0x5b, 0xb3, 0xb7, 0x69, 0xc8, 0x8b, 0x58,
-        0x7f, 0x81,
-    ];
+    let (cell1, previous_out_point1) = gen_simple_otx_cell(
+        &mut data_loader,
+        Capacity::shannons(123456780000),
+        pubkey_hash1,
+        Bytes::from("hello world"),
+    );
 
-    let outpoint = OutPoint::new(Byte32::new_unchecked(tx_hash.into()), 0);
+    let (cell2, previous_out_point2) = gen_common_cell(
+        &mut data_loader,
+        Capacity::shannons(123456780000),
+        pubkey_hash2,
+        Bytes::from("hello world"),
+    );
 
-    let code_hash: Vec<u8> = vec![
-        0x9b, 0xd7, 0xe0, 0x6f, 0x3e, 0xcf, 0x4b, 0xe0, 0xf2, 0xfc, 0xd2, 0x18, 0x8b, 0x23, 0xf1,
-        0xb9, 0xfc, 0xc8, 0x8e, 0x5d, 0x4b, 0x65, 0xa8, 0x63, 0x7b, 0x17, 0x72, 0x3b, 0xbd, 0xa3,
-        0xcc, 0xe8,
-    ];
-
-    let args: [u8; 20] = [
-        0xca, 0x91, 0x1d, 0x88, 0x50, 0xe5, 0x5c, 0xaa, 0xbe, 0x27, 0xc1, 0xfb, 0xf9, 0x0b, 0x52,
-        0x2d, 0xb1, 0x07, 0x74, 0xbc,
-    ];
-
-    let args_param: Bytes = args.to_vec().into();
-
-    let lock = Script::new_builder()
-        .code_hash(Byte32::new_unchecked(code_hash.into()))
-        .hash_type(ScriptHashType::Type.into())
-        .args(args_param.pack())
+    let input_cell_meta1 = CellMetaBuilder::from_cell_output(cell1, Bytes::from("hello world"))
+        .out_point(previous_out_point1.clone())
         .build();
 
-    let output = CellOutput::new_builder()
-        .capacity(Capacity::shannons(0x2540be400).pack())
-        .lock(lock)
+    let input_cell_meta2 = CellMetaBuilder::from_cell_output(cell2, Bytes::from("hello world"))
+        .out_point(previous_out_point2.clone())
+        .build();
+    let resolved_inputs = vec![input_cell_meta1, input_cell_meta2];
+    let mut resolved_cell_deps = vec![];
+
+    let mut random_extra_witness = [0u8; 32];
+    let mut rng = thread_rng();
+    rng.fill(&mut random_extra_witness);
+    let witness_args = WitnessArgsBuilder::default()
+        .extra(Bytes::from(random_extra_witness.to_vec()).pack())
         .build();
 
-    let tx = TransactionBuilder::default()
-        .input(CellInput::new(outpoint, 0x0))
-        .output(output)
-        .output_data(Bytes::new().pack())
-        .build();
+    let output_data1 = Bytes::from("hello world 1").pack();
+    let output_data2 = Bytes::from("hello world 1").pack();
+    let builder = TransactionBuilder::default()
+        .input(CellInput::new(previous_out_point1, 0x2003e8022a0002f3))
+        .input(CellInput::new(previous_out_point2, 0x2003e8022a0002f3))
+        .output(dummy_cell_output(123456780000))
+        .output(dummy_cell_output(123456780000))
+        .output_data(output_data1)
+        .output_data(output_data2)
+        .witness(witness_args.as_bytes().pack())
+        .witness(witness_args.as_bytes().pack());
 
-    sign_simple_otx_by_input_group(tx, &privkey2, 0, 1);
+    let (tx, mut resolved_cell_deps2) = complete_tx(&mut data_loader, builder);
+    let tx = sign_simple_otx_by_input_group(tx, &privkey1, 0, 1);
+    let tx = sign_tx_by_input_group(tx, &privkey2, 1, 1);
+    for dep in resolved_cell_deps2.drain(..) {
+        resolved_cell_deps.push(dep);
+    }
+    let rtx = ResolvedTransaction {
+        transaction: tx,
+        resolved_inputs,
+        resolved_cell_deps,
+        resolved_dep_groups: vec![],
+    };
+
+    let verify_result = TransactionScriptsVerifier::new(&rtx, &data_loader).verify(MAX_CYCLES);
+    verify_result.expect("pass verification");
 }

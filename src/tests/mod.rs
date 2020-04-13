@@ -73,6 +73,10 @@ impl DataLoader for DummyDataLoader {
     }
 }
 
+pub fn blake160(message: &[u8]) -> Bytes {
+    Bytes::from(&ckb_hash::blake2b_256(message)[..20])
+}
+
 // pub fn eth160(message: &[u8]) -> Bytes {
 pub fn eth160(pubkey1: Pubkey) -> Bytes {
     let prefix_key: [u8; 65] = {
